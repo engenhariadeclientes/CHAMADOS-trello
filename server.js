@@ -14,6 +14,16 @@ const TRELLO_TOKEN = process.env.TRELLO_TOKEN;
 const TRELLO_BOARD_ID = process.env.TRELLO_BOARD_ID;
 // Nome exato da lista onde os chamados novos devem cair.
 const LISTA_DESTINO = process.env.TRELLO_LISTA_DESTINO || "TAREFAS PENDENTES";
+// Nome exato da lista pra onde um chamado vai quando você marca como resolvido.
+const LISTA_FINALIZADA = process.env.TRELLO_LISTA_FINALIZADA || "FINALIZADAS";
+// Senha do seu painel privado (/painel). Sem isso configurado, o painel fica bloqueado.
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
+
+// Notificação de WhatsApp a cada chamado novo (opcional — se não configurar,
+// o sistema segue funcionando normal, só sem avisar por WhatsApp).
+const BOTCONVERSA_API_KEY = process.env.BOTCONVERSA_API_KEY;
+const MEU_WHATSAPP = process.env.MEU_WHATSAPP; // seu número com DDI, ex: 5548999999999
+const BOTCONVERSA_BASE = "https://backend.botconversa.com.br/api/v1/webhook";
 
 if (!TRELLO_API_KEY || !TRELLO_TOKEN || !TRELLO_BOARD_ID) {
   console.error("⚠️  Faltam variáveis de ambiente: TRELLO_API_KEY, TRELLO_TOKEN, TRELLO_BOARD_ID");
@@ -23,7 +33,7 @@ const auth = () => `key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}`;
 
 // Cache simples em memória do id da lista e das etiquetas do board.
 // Evita bater na API do Trello a cada chamado aberto.
-let cache = { idList: null, labels: null, carregadoEm: 0 };
+let cache = { idList: null, idListFinalizada: null, labels: null, carregadoEm: 0 };
 const CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutos
 
 async function carregarCache() {
@@ -38,17 +48,25 @@ async function carregarCache() {
   const lists = await listsRes.json();
   const labels = await labelsRes.json();
 
-  const lista = lists.find(
-    (l) => l.name.trim().toLowerCase() === LISTA_DESTINO.trim().toLowerCase()
-  );
+  const norm = (s) => s.trim().toLowerCase();
+
+  const lista = lists.find((l) => norm(l.name) === norm(LISTA_DESTINO));
   if (!lista) {
     throw new Error(
       `Lista "${LISTA_DESTINO}" não encontrada no board. Listas disponíveis: ${lists.map((l) => l.name).join(", ")}`
     );
   }
 
+  const listaFinalizada = lists.find((l) => norm(l.name) === norm(LISTA_FINALIZADA));
+  if (!listaFinalizada) {
+    console.warn(
+      `⚠️  Lista "${LISTA_FINALIZADA}" não encontrada — o botão de resolver no /painel vai falhar até isso existir.`
+    );
+  }
+
   cache = {
     idList: lista.id,
+    idListFinalizada: listaFinalizada ? listaFinalizada.id : null,
     // Mantém id + nome + cor pra devolver ao front sem chamar o Trello de novo.
     labels: labels.map((l) => ({ id: l.id, name: l.name, color: l.color })),
     carregadoEm: Date.now(),
@@ -63,8 +81,130 @@ async function garantirCache() {
   }
 }
 
+// Avisa por WhatsApp que um chamado novo foi aberto. Nunca derruba a criação
+// do cartão se falhar — só loga o erro e segue.
+async function notificarWhatsapp({ card, etiquetaNome, dataDesejada }) {
+  if (!BOTCONVERSA_API_KEY || !MEU_WHATSAPP) {
+    console.warn("⚠️  BOTCONVERSA_API_KEY ou MEU_WHATSAPP não configurados — notificação de WhatsApp pulada.");
+    return;
+  }
+  try {
+    const phone = MEU_WHATSAPP.startsWith("+") ? MEU_WHATSAPP : `+${MEU_WHATSAPP.replace(/\D/g, "")}`;
+
+    const subRes = await fetch(`${BOTCONVERSA_BASE}/subscriber/`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "API-KEY": BOTCONVERSA_API_KEY },
+      body: JSON.stringify({ phone, first_name: "Chamados", last_name: "Sistema" }),
+    });
+    const sub = await subRes.json();
+    if (!sub?.id) {
+      console.error("Falha ao localizar/criar subscriber pra notificação:", JSON.stringify(sub));
+      return;
+    }
+
+    const linhas = [
+      "🎫 Novo chamado aberto",
+      "",
+      card.name,
+    ];
+    if (etiquetaNome) linhas.push(`Prioridade: ${etiquetaNome}`);
+    if (dataDesejada) linhas.push(`Data desejada: ${new Date(dataDesejada).toLocaleDateString("pt-BR")}`);
+    linhas.push("", card.shortUrl);
+
+    const msgRes = await fetch(`${BOTCONVERSA_BASE}/subscriber/${sub.id}/send_message/`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "API-KEY": BOTCONVERSA_API_KEY },
+      body: JSON.stringify({ type: "text", value: linhas.join("\n") }),
+    });
+
+    if (!msgRes.ok) {
+      console.error("Falha ao enviar WhatsApp:", msgRes.status, await msgRes.text());
+    } else {
+      console.log("📱 Notificação de WhatsApp enviada.");
+    }
+  } catch (err) {
+    console.error("Erro ao notificar WhatsApp (não bloqueia o chamado):", err.message);
+  }
+}
+
 // Etiquetas para o formulário — devolve o que o front precisa pra desenhar
 // as opções coloridas.
+// Protege as rotas do painel. Sem ADMIN_PASSWORD configurada, ninguém entra.
+function requireAdmin(req, res, next) {
+  if (!ADMIN_PASSWORD) {
+    return res.status(503).json({ error: "Painel não configurado (falta ADMIN_PASSWORD no servidor)." });
+  }
+  const senha = req.headers["x-admin-password"];
+  if (senha !== ADMIN_PASSWORD) {
+    return res.status(401).json({ error: "Senha incorreta." });
+  }
+  next();
+}
+
+// Lista os chamados em aberto (qualquer lista do board, menos a de finalizados).
+app.get("/api/chamados", requireAdmin, async (req, res) => {
+  try {
+    await garantirCache();
+
+    const camposCartao = "name,desc,due,idList,shortUrl,idLabels,dateLastActivity";
+    const cardsRes = await fetch(
+      `https://api.trello.com/1/boards/${TRELLO_BOARD_ID}/cards/open?${auth()}&fields=${camposCartao}`
+    );
+    if (!cardsRes.ok) throw new Error(`Falha ao buscar cartões: ${cardsRes.status}`);
+    const cards = await cardsRes.json();
+
+    const abertos = cards
+      .filter((c) => c.idList !== cache.idListFinalizada)
+      .map((c) => ({
+        id: c.id,
+        titulo: c.name,
+        descricao: c.desc,
+        dataDesejada: c.due,
+        url: c.shortUrl,
+        ultimaAtividade: c.dateLastActivity,
+        etiquetas: (c.idLabels || [])
+          .map((id) => cache.labels.find((l) => l.id === id))
+          .filter(Boolean),
+      }))
+      // Mais recentes primeiro.
+      .sort((a, b) => new Date(b.ultimaAtividade) - new Date(a.ultimaAtividade));
+
+    res.json({ chamados: abertos });
+  } catch (err) {
+    console.error("Erro ao listar chamados:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Marca um chamado como resolvido: move o cartão pra lista de finalizados.
+// Não apaga de verdade — o cartão continua existindo, só sai da fila ativa.
+app.post("/api/chamados/:id/resolver", requireAdmin, async (req, res) => {
+  try {
+    await garantirCache();
+
+    if (!cache.idListFinalizada) {
+      return res.status(500).json({
+        error: `Lista "${LISTA_FINALIZADA}" não encontrada no board — configure TRELLO_LISTA_FINALIZADA ou crie a lista.`,
+      });
+    }
+
+    const moveRes = await fetch(
+      `https://api.trello.com/1/cards/${req.params.id}?${auth()}&idList=${cache.idListFinalizada}`,
+      { method: "PUT" }
+    );
+    if (!moveRes.ok) {
+      const errText = await moveRes.text();
+      throw new Error(`Trello recusou mover o cartão: ${moveRes.status} ${errText}`);
+    }
+
+    console.log(`✅ Chamado ${req.params.id} marcado como resolvido.`);
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Erro ao resolver chamado:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get("/etiquetas", async (req, res) => {
   try {
     await garantirCache();
@@ -110,6 +250,11 @@ app.post("/criar-chamado", upload.array("anexos", 6), async (req, res) => {
 
     const card = await cardRes.json();
     console.log(`✅ Chamado criado: "${titulo}" — ${card.shortUrl}`);
+
+    const etiquetaNome = etiquetaId
+      ? cache.labels.find((l) => l.id === etiquetaId)?.name
+      : null;
+    notificarWhatsapp({ card, etiquetaNome, dataDesejada }); // não bloqueia — roda em paralelo
 
     // Sobe cada anexo de imagem pro cartão recém-criado.
     const arquivos = req.files || [];
@@ -405,6 +550,221 @@ const PAGINA_HTML = `<!DOCTYPE html>
 
 app.get("/", (req, res) => {
   res.type("html").send(PAGINA_HTML);
+});
+
+const PAGINA_PAINEL = `<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Painel de chamados</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #12141b;
+    --panel: #1a1d27;
+    --panel-2: #21252f;
+    --border: #2b2f3b;
+    --text: #e9eaee;
+    --muted: #8b93a7;
+    --green: #61bd4f;
+    --yellow: #f2d600;
+    --red: #eb5a46;
+    --accent: #6e8fff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Inter', sans-serif;
+    min-height: 100vh;
+    padding: 48px 20px 80px;
+  }
+  main { max-width: 760px; margin: 0 auto; }
+  h1 {
+    font-family: 'Space Grotesk', sans-serif;
+    font-size: 26px;
+    font-weight: 700;
+    margin: 0 0 6px;
+  }
+  .subtitulo { color: var(--muted); font-size: 14px; margin: 0 0 32px; }
+
+  /* Tela de senha */
+  #tela-login {
+    max-width: 360px;
+    margin: 80px auto 0;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 28px;
+    text-align: center;
+  }
+  #tela-login input {
+    width: 100%;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 11px 13px;
+    color: var(--text);
+    font-size: 15px;
+    margin: 16px 0;
+    outline: none;
+  }
+  #tela-login input:focus { border-color: var(--accent); }
+  #tela-login button, .btn-resolver {
+    background: var(--accent);
+    color: #0e1016;
+    border: none;
+    border-radius: 8px;
+    padding: 11px 16px;
+    font-weight: 700;
+    font-size: 14px;
+    cursor: pointer;
+    font-family: 'Inter', sans-serif;
+  }
+  #erro-login { color: var(--red); font-size: 13px; margin-top: 10px; display: none; }
+
+  /* Lista de chamados */
+  #painel { display: none; }
+  .chamado {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px;
+    margin-bottom: 14px;
+  }
+  .chamado h3 { margin: 0 0 8px; font-size: 17px; font-weight: 600; }
+  .chamado p { margin: 0 0 12px; color: var(--muted); font-size: 14px; line-height: 1.5; white-space: pre-wrap; }
+  .meta { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; align-items: center; }
+  .chip {
+    font-size: 11.5px;
+    font-weight: 600;
+    padding: 4px 9px;
+    border-radius: 6px;
+    color: #14161c;
+  }
+  .chip.data { background: var(--panel-2); color: var(--muted); border: 1px solid var(--border); }
+  .chip[data-cor="green"]  { background: var(--green); }
+  .chip[data-cor="yellow"] { background: var(--yellow); }
+  .chip[data-cor="red"]    { background: var(--red); color: #fff; }
+  .acoes { display: flex; gap: 10px; align-items: center; }
+  .acoes a { color: var(--accent); font-size: 13px; text-decoration: none; }
+  #vazio { color: var(--muted); text-align: center; padding: 40px 0; display: none; }
+  #carregando { color: var(--muted); text-align: center; padding: 40px 0; }
+</style>
+</head>
+<body>
+<main>
+  <div id="tela-login">
+    <h1 style="font-size:20px;">Entrar no painel</h1>
+    <input type="password" id="senha" placeholder="Senha" autofocus />
+    <button onclick="entrar()">Entrar</button>
+    <div id="erro-login">Senha incorreta.</div>
+  </div>
+
+  <div id="painel">
+    <h1>Chamados em aberto</h1>
+    <p class="subtitulo">Marcar como resolvido move o cartão pra lista Finalizadas no Trello — nada é apagado de verdade.</p>
+    <div id="carregando">Carregando...</div>
+    <div id="vazio">Nenhum chamado em aberto. 🎉</div>
+    <div id="lista"></div>
+  </div>
+</main>
+
+<script>
+  let senhaAtual = sessionStorage.getItem("painel_senha") || "";
+
+  async function chamarApi(path, opts = {}) {
+    const res = await fetch(path, {
+      ...opts,
+      headers: { ...(opts.headers || {}), "x-admin-password": senhaAtual },
+    });
+    if (res.status === 401) throw new Error("senha_invalida");
+    if (!res.ok) throw new Error((await res.json()).error || "Erro na requisição.");
+    return res.json();
+  }
+
+  async function entrar() {
+    senhaAtual = document.getElementById("senha").value;
+    try {
+      await carregarChamados();
+      sessionStorage.setItem("painel_senha", senhaAtual);
+      document.getElementById("tela-login").style.display = "none";
+      document.getElementById("painel").style.display = "block";
+    } catch (err) {
+      document.getElementById("erro-login").style.display = "block";
+    }
+  }
+
+  async function carregarChamados() {
+    const data = await chamarApi("/api/chamados");
+    const listaEl = document.getElementById("lista");
+    const vazioEl = document.getElementById("vazio");
+    document.getElementById("carregando").style.display = "none";
+    listaEl.innerHTML = "";
+
+    if (!data.chamados.length) {
+      vazioEl.style.display = "block";
+      return;
+    }
+    vazioEl.style.display = "none";
+
+    data.chamados.forEach((c) => {
+      const div = document.createElement("div");
+      div.className = "chamado";
+      const dataFmt = c.dataDesejada
+        ? new Date(c.dataDesejada).toLocaleDateString("pt-BR")
+        : null;
+
+      div.innerHTML = \`
+        <h3>\${c.titulo}</h3>
+        \${c.descricao ? \`<p>\${c.descricao}</p>\` : ""}
+        <div class="meta">
+          \${c.etiquetas.map((e) => \`<span class="chip" data-cor="\${e.color}">\${e.name}</span>\`).join("")}
+          \${dataFmt ? \`<span class="chip data">Precisa até \${dataFmt}</span>\` : ""}
+        </div>
+        <div class="acoes">
+          <button class="btn-resolver" data-id="\${c.id}">Marcar como resolvido</button>
+          <a href="\${c.url}" target="_blank" rel="noopener">Ver no Trello →</a>
+        </div>
+      \`;
+      listaEl.appendChild(div);
+    });
+
+    document.querySelectorAll(".btn-resolver").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        btn.disabled = true;
+        btn.textContent = "Resolvendo...";
+        try {
+          await chamarApi(\`/api/chamados/\${btn.dataset.id}/resolver\`, { method: "POST" });
+          btn.closest(".chamado").remove();
+          if (!document.querySelectorAll(".chamado").length) {
+            document.getElementById("vazio").style.display = "block";
+          }
+        } catch (err) {
+          btn.disabled = false;
+          btn.textContent = "Marcar como resolvido";
+          alert("Erro: " + err.message);
+        }
+      });
+    });
+  }
+
+  document.getElementById("senha").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") entrar();
+  });
+
+  // Se já tem senha guardada nessa aba, tenta entrar direto.
+  if (senhaAtual) entrar();
+</script>
+</body>
+</html>
+`;
+
+app.get("/painel", (req, res) => {
+  res.type("html").send(PAGINA_PAINEL);
 });
 
 app.listen(PORT, "0.0.0.0", () => console.log(`Servidor rodando na porta ${PORT}`));
