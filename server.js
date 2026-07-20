@@ -31,7 +31,14 @@ const auth = () => `key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}`;
 
 // Cache simples em memória do id da lista e das etiquetas do board.
 // Evita bater na API do Trello a cada chamado aberto.
-let cache = { idList: null, idListFinalizada: null, idListAprovacao: null, labels: null, carregadoEm: 0 };
+let cache = {
+  idList: null,
+  idListFinalizada: null,
+  idListAprovacao: null,
+  labels: null,
+  nomesDasListas: {}, // id -> nome, todas as listas do board
+  carregadoEm: 0,
+};
 const CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutos
 
 async function carregarCache() {
@@ -75,6 +82,7 @@ async function carregarCache() {
     idListAprovacao: listaAprovacao ? listaAprovacao.id : null,
     // Mantém id + nome + cor pra devolver ao front sem chamar o Trello de novo.
     labels: labels.map((l) => ({ id: l.id, name: l.name, color: l.color })),
+    nomesDasListas: Object.fromEntries(lists.map((l) => [l.id, l.name])),
     carregadoEm: Date.now(),
   };
 
@@ -92,6 +100,12 @@ async function garantirCache() {
 function extrairSolicitante(desc) {
   const m = /^Solicitante: (.+?) \((.*?)\)\s*$/m.exec(desc || "");
   return m ? { nome: m[1].trim(), telefone: m[2].trim() } : null;
+}
+
+// Só os dígitos — pra comparar telefones sem depender de formatação
+// ("+55 48..." vs "5548..." vs "48...").
+function apenasDigitos(s) {
+  return String(s || "").replace(/\D/g, "");
 }
 
 // Token curto pra proteger os links de confirmação que vão por WhatsApp —
@@ -206,6 +220,43 @@ app.post("/api/chamados/:id/resolver", requireAdmin, express.json(), async (req,
 
 // A partir daqui, páginas/ações PÚBLICAS (sem senha de admin) — protegidas só
 // pelo token, porque quem acessa é a pessoa que abriu o chamado, não você.
+
+// Busca pública — quem abriu o chamado consulta pelo telefone que usou.
+// Sem senha de admin (não é dado sensível pro board, só o status).
+app.get("/api/meus-chamados", async (req, res) => {
+  try {
+    await garantirCache();
+
+    const telefoneBuscado = apenasDigitos(req.query.telefone);
+    if (!telefoneBuscado || telefoneBuscado.length < 8) {
+      return res.status(400).json({ error: "Digite um telefone válido." });
+    }
+
+    const cardsRes = await fetch(
+      `https://api.trello.com/1/boards/${TRELLO_BOARD_ID}/cards/open?${auth()}&fields=name,desc,idList,shortUrl,dateLastActivity`
+    );
+    if (!cardsRes.ok) throw new Error(`Falha ao buscar cartões: ${cardsRes.status}`);
+    const cards = await cardsRes.json();
+
+    const meus = cards
+      .filter((c) => {
+        const solicitante = extrairSolicitante(c.desc);
+        return solicitante && apenasDigitos(solicitante.telefone) === telefoneBuscado;
+      })
+      .map((c) => ({
+        titulo: c.name,
+        status: cache.nomesDasListas[c.idList] || "Em andamento",
+        finalizado: c.idList === cache.idListFinalizada,
+        ultimaAtividade: c.dateLastActivity,
+      }))
+      .sort((a, b) => new Date(b.ultimaAtividade) - new Date(a.ultimaAtividade));
+
+    res.json({ chamados: meus });
+  } catch (err) {
+    console.error("Erro ao buscar chamados do solicitante:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
 
 app.get("/confirmar/:id", async (req, res) => {
   const { id } = req.params;
@@ -586,7 +637,7 @@ const PAGINA_HTML = `<!DOCTYPE html>
 <body>
 <main>
   <h1>Abrir chamado</h1>
-  <p class="subtitulo">Cai direto na lista Tarefas Pendentes do board.</p>
+  <p class="subtitulo">Cai direto na lista Tarefas Pendentes do board. <a href="/meus-chamados" style="color: var(--accent);">Já abriu um chamado? Confira o status aqui →</a></p>
 
   <form class="card" id="form-chamado">
     <label for="titulo">Título</label>
@@ -830,7 +881,7 @@ const PAGINA_PAINEL = `<!DOCTYPE html>
 </main>
 
 <script>
-  let senhaAtual = sessionStorage.getItem("painel_senha") || "";
+  let senhaAtual = localStorage.getItem("painel_senha") || "";
 
   async function chamarApi(path, opts = {}) {
     const res = await fetch(path, {
@@ -842,16 +893,22 @@ const PAGINA_PAINEL = `<!DOCTYPE html>
     return res.json();
   }
 
-  async function entrar() {
-    senhaAtual = document.getElementById("senha").value;
+  // Tenta entrar com a senha passada (do campo, ou guardada de antes).
+  // Separado do clique do botão pra não zerar a senha guardada ao recarregar.
+  async function tentarEntrar(senha) {
+    senhaAtual = senha;
     try {
       await carregarChamados();
-      sessionStorage.setItem("painel_senha", senhaAtual);
+      localStorage.setItem("painel_senha", senhaAtual);
       document.getElementById("tela-login").style.display = "none";
       document.getElementById("painel").style.display = "block";
     } catch (err) {
       document.getElementById("erro-login").style.display = "block";
     }
+  }
+
+  function entrar() {
+    tentarEntrar(document.getElementById("senha").value);
   }
 
   async function carregarChamados() {
@@ -948,7 +1005,7 @@ const PAGINA_PAINEL = `<!DOCTYPE html>
   });
 
   // Se já tem senha guardada nessa aba, tenta entrar direto.
-  if (senhaAtual) entrar();
+  if (senhaAtual) tentarEntrar(senhaAtual);
 </script>
 </body>
 </html>
@@ -956,6 +1013,111 @@ const PAGINA_PAINEL = `<!DOCTYPE html>
 
 app.get("/painel", (req, res) => {
   res.type("html").send(PAGINA_PAINEL);
+});
+
+const PAGINA_MEUS_CHAMADOS = `<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Meus chamados</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
+<style>
+  :root { --bg:#12141b; --panel:#1a1d27; --panel-2:#21252f; --border:#2b2f3b; --text:#e9eaee; --muted:#8b93a7; --green:#61bd4f; --accent:#6e8fff; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font-family:'Inter',sans-serif; min-height:100vh; padding:48px 20px 80px; }
+  main { max-width:520px; margin:0 auto; }
+  h1 { font-family:'Space Grotesk',sans-serif; font-size:26px; font-weight:700; margin:0 0 6px; }
+  .subtitulo { color:var(--muted); font-size:14px; margin:0 0 28px; }
+  .busca { display:flex; gap:8px; margin-bottom: 28px; }
+  input {
+    flex:1; background:var(--panel-2); border:1px solid var(--border); border-radius:8px;
+    padding:11px 13px; color:var(--text); font-size:15px; outline:none;
+  }
+  input:focus { border-color: var(--accent); }
+  button {
+    background:var(--accent); color:#0e1016; border:none; border-radius:8px;
+    padding:11px 18px; font-weight:700; font-size:14px; cursor:pointer; font-family:'Inter',sans-serif;
+  }
+  button:disabled { opacity:0.6; cursor:not-allowed; }
+  .chamado { background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:18px 20px; margin-bottom:12px; }
+  .chamado h3 { margin:0 0 8px; font-size:15.5px; font-weight:600; }
+  .status {
+    display:inline-block; font-size:12px; font-weight:700; padding:4px 10px; border-radius:6px;
+    background: var(--panel-2); color: var(--muted); border: 1px solid var(--border);
+  }
+  .status.finalizado { background: var(--green); color:#0e1016; border-color: transparent; }
+  #vazio, #erro { color:var(--muted); text-align:center; padding:30px 0; display:none; font-size:14px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Meus chamados</h1>
+  <p class="subtitulo">Digite o WhatsApp que você usou ao abrir o chamado.</p>
+
+  <div class="busca">
+    <input type="text" id="telefone" placeholder="DDI + DDD + número, ex: 5548999999999" />
+    <button id="btn-buscar">Buscar</button>
+  </div>
+
+  <div id="erro">Não achamos nenhum chamado com esse número.</div>
+  <div id="vazio"></div>
+  <div id="lista"></div>
+</main>
+
+<script>
+  const input = document.getElementById("telefone");
+  const btn = document.getElementById("btn-buscar");
+  const listaEl = document.getElementById("lista");
+  const erroEl = document.getElementById("erro");
+
+  async function buscar() {
+    const telefone = input.value.trim();
+    if (!telefone) return;
+
+    btn.disabled = true;
+    btn.textContent = "Buscando...";
+    erroEl.style.display = "none";
+    listaEl.innerHTML = "";
+
+    try {
+      const res = await fetch(\`/api/meus-chamados?telefone=\${encodeURIComponent(telefone)}\`);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Erro ao buscar.");
+
+      if (!data.chamados.length) {
+        erroEl.style.display = "block";
+        return;
+      }
+
+      data.chamados.forEach((c) => {
+        const div = document.createElement("div");
+        div.className = "chamado";
+        div.innerHTML = \`
+          <h3>\${c.titulo}</h3>
+          <span class="status \${c.finalizado ? "finalizado" : ""}">\${c.status}</span>
+        \`;
+        listaEl.appendChild(div);
+      });
+    } catch (err) {
+      erroEl.textContent = err.message;
+      erroEl.style.display = "block";
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "Buscar";
+    }
+  }
+
+  btn.addEventListener("click", buscar);
+  input.addEventListener("keydown", (e) => { if (e.key === "Enter") buscar(); });
+</script>
+</body>
+</html>
+`;
+
+app.get("/meus-chamados", (req, res) => {
+  res.type("html").send(PAGINA_MEUS_CHAMADOS);
 });
 
 app.listen(PORT, "0.0.0.0", () => console.log(`Servidor rodando na porta ${PORT}`));
