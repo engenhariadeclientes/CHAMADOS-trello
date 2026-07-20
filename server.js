@@ -336,7 +336,12 @@ app.get("/api/anexo", (req, res) => {
 
   const url = req.query.url || "";
   // Só redireciona pra URLs do próprio Trello — evita virar um redirecionador aberto.
-  if (!url.startsWith("https://api.trello.com/") && !url.startsWith("https://trello-attachments.s3.amazonaws.com/")) {
+  const dominiosPermitidos = [
+    "https://api.trello.com/",
+    "https://trello.com/",
+    "https://trello-attachments.s3.amazonaws.com/",
+  ];
+  if (!dominiosPermitidos.some((d) => url.startsWith(d))) {
     return res.status(400).send("URL inválida.");
   }
 
