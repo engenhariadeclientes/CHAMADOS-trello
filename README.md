@@ -29,6 +29,21 @@ Guarde os dois — vão virar variáveis de ambiente.
 | `TRELLO_TOKEN` | o Token do passo 1 |
 | `TRELLO_BOARD_ID` | `XIQU86kd` (o pedaço da URL do board: `trello.com/b/XIQU86kd/...`) |
 | `TRELLO_LISTA_DESTINO` | `TAREFAS PENDENTES` (opcional — já é o padrão) |
+| `BOTCONVERSA_API_KEY` | a mesma chave que vocês já usam nos outros serviços (Duplique/DSC) |
+| `MEU_WHATSAPP` | seu número com DDI, ex: `5548999999999` (opcional — sem isso, o sistema funciona igual, só sem avisar por WhatsApp) |
+| `ADMIN_PASSWORD` | uma senha sua, à sua escolha — protege o `/painel` (sem isso configurado, o painel fica bloqueado pra todo mundo) |
+| `TRELLO_LISTA_FINALIZADA` | `FINALIZADAS` (opcional — já é o padrão) |
+
+## O painel (`/painel`)
+
+Acesse `sua-url.up.railway.app/painel` — pede uma senha (a que você colocou em
+`ADMIN_PASSWORD`) e mostra todos os chamados em aberto, com um botão
+**"Marcar como resolvido"** em cada um.
+
+Resolver um chamado **não apaga nada de verdade** — o cartão é movido pra
+lista **FINALIZADAS** no Trello (a mesma que já existe no seu board). Ele
+some da lista de pendências do painel, mas continua salvo lá, com todo o
+histórico e os anexos.
 
 ## 3. Deploy
 
