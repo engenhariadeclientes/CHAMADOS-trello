@@ -1,5 +1,6 @@
 const express = require("express");
 const multer = require("multer");
+const crypto = require("crypto");
 const app = express();
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -16,14 +17,11 @@ const TRELLO_BOARD_ID = process.env.TRELLO_BOARD_ID;
 const LISTA_DESTINO = process.env.TRELLO_LISTA_DESTINO || "TAREFAS PENDENTES";
 // Nome exato da lista pra onde um chamado vai quando você marca como resolvido.
 const LISTA_FINALIZADA = process.env.TRELLO_LISTA_FINALIZADA || "FINALIZADAS";
+// Nome exato da lista pra onde o chamado vai enquanto espera a confirmação
+// de quem abriu (antes de virar "finalizado" de vez).
+const LISTA_APROVACAO = process.env.TRELLO_LISTA_APROVACAO || "AGUARDANDO APROVAÇÃO";
 // Senha do seu painel privado (/painel). Sem isso configurado, o painel fica bloqueado.
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
-
-// Notificação de WhatsApp a cada chamado novo (opcional — se não configurar,
-// o sistema segue funcionando normal, só sem avisar por WhatsApp).
-const BOTCONVERSA_API_KEY = process.env.BOTCONVERSA_API_KEY;
-const MEU_WHATSAPP = process.env.MEU_WHATSAPP; // seu número com DDI, ex: 5548999999999
-const BOTCONVERSA_BASE = "https://backend.botconversa.com.br/api/v1/webhook";
 
 if (!TRELLO_API_KEY || !TRELLO_TOKEN || !TRELLO_BOARD_ID) {
   console.error("⚠️  Faltam variáveis de ambiente: TRELLO_API_KEY, TRELLO_TOKEN, TRELLO_BOARD_ID");
@@ -33,7 +31,7 @@ const auth = () => `key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}`;
 
 // Cache simples em memória do id da lista e das etiquetas do board.
 // Evita bater na API do Trello a cada chamado aberto.
-let cache = { idList: null, idListFinalizada: null, labels: null, carregadoEm: 0 };
+let cache = { idList: null, idListFinalizada: null, idListAprovacao: null, labels: null, carregadoEm: 0 };
 const CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutos
 
 async function carregarCache() {
@@ -64,9 +62,17 @@ async function carregarCache() {
     );
   }
 
+  const listaAprovacao = lists.find((l) => norm(l.name) === norm(LISTA_APROVACAO));
+  if (!listaAprovacao) {
+    console.warn(
+      `⚠️  Lista "${LISTA_APROVACAO}" não encontrada — a etapa de confirmação com quem abriu o chamado vai falhar até isso existir.`
+    );
+  }
+
   cache = {
     idList: lista.id,
     idListFinalizada: listaFinalizada ? listaFinalizada.id : null,
+    idListAprovacao: listaAprovacao ? listaAprovacao.id : null,
     // Mantém id + nome + cor pra devolver ao front sem chamar o Trello de novo.
     labels: labels.map((l) => ({ id: l.id, name: l.name, color: l.color })),
     carregadoEm: Date.now(),
@@ -81,50 +87,24 @@ async function garantirCache() {
   }
 }
 
-// Avisa por WhatsApp que um chamado novo foi aberto. Nunca derruba a criação
-// do cartão se falhar — só loga o erro e segue.
-async function notificarWhatsapp({ card, etiquetaNome, dataDesejada }) {
-  if (!BOTCONVERSA_API_KEY || !MEU_WHATSAPP) {
-    console.warn("⚠️  BOTCONVERSA_API_KEY ou MEU_WHATSAPP não configurados — notificação de WhatsApp pulada.");
-    return;
-  }
-  try {
-    const phone = MEU_WHATSAPP.startsWith("+") ? MEU_WHATSAPP : `+${MEU_WHATSAPP.replace(/\D/g, "")}`;
+// Extrai "Solicitante: Nome (telefone)" da descrição do cartão — é assim que
+// guardamos quem abriu o chamado, já que o formulário público não tem login.
+function extrairSolicitante(desc) {
+  const m = /^Solicitante: (.+?) \((.*?)\)\s*$/m.exec(desc || "");
+  return m ? { nome: m[1].trim(), telefone: m[2].trim() } : null;
+}
 
-    const subRes = await fetch(`${BOTCONVERSA_BASE}/subscriber/`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "API-KEY": BOTCONVERSA_API_KEY },
-      body: JSON.stringify({ phone, first_name: "Chamados", last_name: "Sistema" }),
-    });
-    const sub = await subRes.json();
-    if (!sub?.id) {
-      console.error("Falha ao localizar/criar subscriber pra notificação:", JSON.stringify(sub));
-      return;
-    }
-
-    const linhas = [
-      "🎫 Novo chamado aberto",
-      "",
-      card.name,
-    ];
-    if (etiquetaNome) linhas.push(`Prioridade: ${etiquetaNome}`);
-    if (dataDesejada) linhas.push(`Data desejada: ${new Date(dataDesejada).toLocaleDateString("pt-BR")}`);
-    linhas.push("", card.shortUrl);
-
-    const msgRes = await fetch(`${BOTCONVERSA_BASE}/subscriber/${sub.id}/send_message/`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "API-KEY": BOTCONVERSA_API_KEY },
-      body: JSON.stringify({ type: "text", value: linhas.join("\n") }),
-    });
-
-    if (!msgRes.ok) {
-      console.error("Falha ao enviar WhatsApp:", msgRes.status, await msgRes.text());
-    } else {
-      console.log("📱 Notificação de WhatsApp enviada.");
-    }
-  } catch (err) {
-    console.error("Erro ao notificar WhatsApp (não bloqueia o chamado):", err.message);
-  }
+// Token curto pra proteger os links de confirmação que vão por WhatsApp —
+// sem precisar guardar nada em banco, só recalcula e compara.
+function gerarToken(cardId) {
+  return crypto
+    .createHmac("sha256", ADMIN_PASSWORD || "segredo-padrao-troque-a-senha")
+    .update(cardId)
+    .digest("hex")
+    .slice(0, 20);
+}
+function tokenValido(cardId, token) {
+  return typeof token === "string" && token === gerarToken(cardId);
 }
 
 // Etiquetas para o formulário — devolve o que o front precisa pra desenhar
@@ -148,13 +128,13 @@ app.get("/api/chamados", requireAdmin, async (req, res) => {
 
     const camposCartao = "name,desc,due,idList,shortUrl,idLabels,dateLastActivity";
     const cardsRes = await fetch(
-      `https://api.trello.com/1/boards/${TRELLO_BOARD_ID}/cards/open?${auth()}&fields=${camposCartao}`
+      `https://api.trello.com/1/boards/${TRELLO_BOARD_ID}/cards/open?${auth()}&fields=${camposCartao}&attachments=true&attachment_fields=id,name,mimeType`
     );
     if (!cardsRes.ok) throw new Error(`Falha ao buscar cartões: ${cardsRes.status}`);
     const cards = await cardsRes.json();
 
     const abertos = cards
-      .filter((c) => c.idList !== cache.idListFinalizada)
+      .filter((c) => c.idList !== cache.idListFinalizada && c.idList !== cache.idListAprovacao)
       .map((c) => ({
         id: c.id,
         titulo: c.name,
@@ -165,6 +145,9 @@ app.get("/api/chamados", requireAdmin, async (req, res) => {
         etiquetas: (c.idLabels || [])
           .map((id) => cache.labels.find((l) => l.id === id))
           .filter(Boolean),
+        imagens: (c.attachments || [])
+          .filter((a) => a.mimeType && a.mimeType.startsWith("image/"))
+          .map((a) => ({ id: a.id, nome: a.name })),
       }))
       // Mais recentes primeiro.
       .sort((a, b) => new Date(b.ultimaAtividade) - new Date(a.ultimaAtividade));
@@ -178,18 +161,22 @@ app.get("/api/chamados", requireAdmin, async (req, res) => {
 
 // Marca um chamado como resolvido: move o cartão pra lista de finalizados.
 // Não apaga de verdade — o cartão continua existindo, só sai da fila ativa.
-app.post("/api/chamados/:id/resolver", requireAdmin, async (req, res) => {
+app.post("/api/chamados/:id/resolver", requireAdmin, express.json(), async (req, res) => {
   try {
     await garantirCache();
 
-    if (!cache.idListFinalizada) {
+    if (!cache.idListAprovacao) {
       return res.status(500).json({
-        error: `Lista "${LISTA_FINALIZADA}" não encontrada no board — configure TRELLO_LISTA_FINALIZADA ou crie a lista.`,
+        error: `Lista "${LISTA_APROVACAO}" não encontrada no board — configure TRELLO_LISTA_APROVACAO ou crie a lista.`,
       });
     }
 
+    const cardId = req.params.id;
+    const descricao = (req.body && req.body.descricao) || "";
+    const titulo = (req.body && req.body.titulo) || "";
+
     const moveRes = await fetch(
-      `https://api.trello.com/1/cards/${req.params.id}?${auth()}&idList=${cache.idListFinalizada}`,
+      `https://api.trello.com/1/cards/${cardId}?${auth()}&idList=${cache.idListAprovacao}`,
       { method: "PUT" }
     );
     if (!moveRes.ok) {
@@ -197,11 +184,170 @@ app.post("/api/chamados/:id/resolver", requireAdmin, async (req, res) => {
       throw new Error(`Trello recusou mover o cartão: ${moveRes.status} ${errText}`);
     }
 
-    console.log(`✅ Chamado ${req.params.id} marcado como resolvido.`);
-    res.json({ success: true });
+    console.log(`➡️  Chamado ${cardId} movido pra aguardando aprovação.`);
+
+    // Gera o link de confirmação pra você copiar e mandar como quiser
+    // (WhatsApp manual, e-mail etc.) — não mandamos nada automático.
+    const baseUrl = `${req.protocol}://${req.get("host")}`;
+    const token = gerarToken(cardId);
+    const linkConfirmacao = `${baseUrl}/confirmar/${cardId}?token=${token}`;
+    const solicitante = extrairSolicitante(descricao);
+
+    res.json({
+      success: true,
+      linkConfirmacao,
+      solicitante: solicitante ? solicitante.nome : null,
+    });
   } catch (err) {
     console.error("Erro ao resolver chamado:", err.message);
     res.status(500).json({ error: err.message });
+  }
+});
+
+// A partir daqui, páginas/ações PÚBLICAS (sem senha de admin) — protegidas só
+// pelo token, porque quem acessa é a pessoa que abriu o chamado, não você.
+
+app.get("/confirmar/:id", async (req, res) => {
+  const { id } = req.params;
+  const { token } = req.query;
+
+  if (!tokenValido(id, token)) {
+    return res.type("html").send(paginaMensagem("Link inválido", "Esse link de confirmação não é válido."));
+  }
+
+  try {
+    const cardRes = await fetch(`https://api.trello.com/1/cards/${id}?${auth()}&fields=name,desc,closed`);
+    if (!cardRes.ok) throw new Error("Cartão não encontrado.");
+    const card = await cardRes.json();
+
+    res.type("html").send(paginaConfirmacao(card, token));
+  } catch (err) {
+    res.type("html").send(paginaMensagem("Erro", err.message));
+  }
+});
+
+app.post("/api/confirmar/:id", express.json(), async (req, res) => {
+  const { id } = req.params;
+  const { token, decisao } = req.body || {};
+
+  if (!tokenValido(id, token)) return res.status(401).json({ error: "Token inválido." });
+
+  try {
+    await garantirCache();
+    const listaDestino = decisao === "reabrir" ? cache.idList : cache.idListFinalizada;
+    const nomeLista = decisao === "reabrir" ? LISTA_DESTINO : LISTA_FINALIZADA;
+
+    if (!listaDestino) {
+      return res.status(500).json({ error: `Lista "${nomeLista}" não encontrada no board.` });
+    }
+
+    const moveRes = await fetch(`https://api.trello.com/1/cards/${id}?${auth()}&idList=${listaDestino}`, {
+      method: "PUT",
+    });
+    if (!moveRes.ok) throw new Error(`Trello recusou mover o cartão: ${moveRes.status}`);
+
+    if (decisao === "reabrir") {
+      console.log(`🔁 Chamado ${id} reaberto pelo solicitante — não estava resolvido de verdade.`);
+    }
+
+    console.log(`✅ Chamado ${id} — decisão do solicitante: ${decisao}`);
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Erro ao processar confirmação:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+function paginaMensagem(titulo, texto) {
+  return `<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>${titulo}</title>
+  <style>body{background:#12141b;color:#e9eaee;font-family:sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;padding:20px;text-align:center;}
+  .box{max-width:400px;} h1{font-size:22px;}</style></head>
+  <body><div class="box"><h1>${titulo}</h1><p>${texto}</p></div></body></html>`;
+}
+
+function paginaConfirmacao(card, token) {
+  return `<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Confirmar chamado</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root { --bg:#12141b; --panel:#1a1d27; --border:#2b2f3b; --text:#e9eaee; --muted:#8b93a7; --green:#61bd4f; --red:#eb5a46; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font-family:'Inter',sans-serif; min-height:100vh; display:flex; align-items:center; justify-content:center; padding:20px; }
+  .card { max-width:440px; width:100%; background:var(--panel); border:1px solid var(--border); border-radius:14px; padding:28px; }
+  h1 { font-size:20px; margin:0 0 6px; }
+  .sub { color:var(--muted); font-size:14px; margin:0 0 20px; }
+  .desc { white-space:pre-wrap; font-size:14px; color:var(--muted); background:#21252f; border:1px solid var(--border); border-radius:8px; padding:14px; margin-bottom:22px; max-height:200px; overflow:auto; }
+  button { width:100%; border:none; border-radius:8px; padding:13px; font-size:14.5px; font-weight:700; cursor:pointer; margin-bottom:10px; font-family:'Inter',sans-serif; }
+  #btn-sim { background:var(--green); color:#0e1016; }
+  #btn-nao { background:transparent; color:var(--red); border:1px solid var(--red); }
+  #resultado { text-align:center; padding:20px 0; display:none; }
+</style>
+</head>
+<body>
+  <div class="card" id="tela">
+    <h1>${card.name}</h1>
+    <p class="sub">Seu chamado foi marcado como resolvido. Confirma que está tudo certo?</p>
+    ${card.desc ? `<div class="desc">${card.desc}</div>` : ""}
+    <button id="btn-sim">Sim, está resolvido ✅</button>
+    <button id="btn-nao">Não, ainda não 🔁</button>
+  </div>
+  <div class="card" id="resultado"></div>
+
+<script>
+  async function decidir(decisao) {
+    document.getElementById("tela").style.display = "none";
+    const res = document.getElementById("resultado");
+    res.style.display = "block";
+    res.innerHTML = "<p>Enviando...</p>";
+    try {
+      const resp = await fetch("/api/confirmar/${card.id}", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token: "${token}", decisao }),
+      });
+      const data = await resp.json();
+      if (!resp.ok) throw new Error(data.error || "Erro ao registrar sua resposta.");
+      res.innerHTML = decisao === "reabrir"
+        ? "<h1>Combinado 🔁</h1><p>Avisamos que ainda precisa de atenção.</p>"
+        : "<h1>Show, valeu! ✅</h1><p>Chamado encerrado.</p>";
+    } catch (err) {
+      res.innerHTML = "<h1>Ops</h1><p>" + err.message + "</p>";
+    }
+  }
+  document.getElementById("btn-sim").addEventListener("click", () => decidir("confirmar"));
+  document.getElementById("btn-nao").addEventListener("click", () => decidir("reabrir"));
+</script>
+</body>
+</html>`;
+}
+
+// Proxy pra exibir a imagem anexada no <img> do painel — a tag <img> não
+// manda o header de senha, então aqui a senha vem por query param mesmo.
+// Só serve pra imagem já vinculada a um cartão real do board, então o risco
+// de vazamento é baixo mesmo assim.
+app.get("/api/anexo/:cardId/:attachmentId", async (req, res) => {
+  if (req.query.senha !== ADMIN_PASSWORD) return res.status(401).send("não autorizado");
+  try {
+    const attRes = await fetch(
+      `https://api.trello.com/1/cards/${req.params.cardId}/attachments/${req.params.attachmentId}?${auth()}`
+    );
+    if (!attRes.ok) throw new Error(`Falha ao buscar anexo: ${attRes.status}`);
+    const att = await attRes.json();
+
+    const fileRes = await fetch(`${att.url}?${auth()}`);
+    if (!fileRes.ok) throw new Error(`Falha ao baixar anexo: ${fileRes.status}`);
+
+    res.set("Content-Type", att.mimeType || "application/octet-stream");
+    res.send(Buffer.from(await fileRes.arrayBuffer()));
+  } catch (err) {
+    console.error("Erro ao servir anexo:", err.message);
+    res.status(500).send("Erro ao carregar imagem.");
   }
 });
 
@@ -219,7 +365,7 @@ app.post("/criar-chamado", upload.array("anexos", 6), async (req, res) => {
   try {
     await garantirCache();
 
-    const { titulo, descricao, dataDesejada, etiquetaId } = req.body;
+    const { titulo, descricao, dataDesejada, etiquetaId, solicitanteNome, solicitanteWhatsapp } = req.body;
 
     if (!titulo || !titulo.trim()) {
       return res.status(400).json({ error: "Título é obrigatório." });
@@ -228,8 +374,12 @@ app.post("/criar-chamado", upload.array("anexos", 6), async (req, res) => {
     const agora = new Date();
     const abertoEm = agora.toLocaleString("pt-BR", { timeZone: "America/Sao_Paulo" });
 
-    const descCompleta =
-      `Aberto em: ${abertoEm}\n\n` + (descricao && descricao.trim() ? descricao.trim() : "(sem detalhes adicionais)");
+    const linhasDesc = [`Aberto em: ${abertoEm}`];
+    if (solicitanteNome && solicitanteNome.trim()) {
+      linhasDesc.push(`Solicitante: ${solicitanteNome.trim()} (${(solicitanteWhatsapp || "").trim()})`);
+    }
+    linhasDesc.push("", descricao && descricao.trim() ? descricao.trim() : "(sem detalhes adicionais)");
+    const descCompleta = linhasDesc.join("\n");
 
     const params = new URLSearchParams({
       idList: cache.idList,
@@ -250,11 +400,6 @@ app.post("/criar-chamado", upload.array("anexos", 6), async (req, res) => {
 
     const card = await cardRes.json();
     console.log(`✅ Chamado criado: "${titulo}" — ${card.shortUrl}`);
-
-    const etiquetaNome = etiquetaId
-      ? cache.labels.find((l) => l.id === etiquetaId)?.name
-      : null;
-    notificarWhatsapp({ card, etiquetaNome, dataDesejada }); // não bloqueia — roda em paralelo
 
     // Sobe cada anexo de imagem pro cartão recém-criado.
     const arquivos = req.files || [];
@@ -449,6 +594,13 @@ const PAGINA_HTML = `<!DOCTYPE html>
     <label for="titulo">Título</label>
     <input type="text" id="titulo" name="titulo" placeholder="Resumo curto do que precisa" required maxlength="200" />
 
+    <label for="solicitanteNome">Seu nome</label>
+    <input type="text" id="solicitanteNome" name="solicitanteNome" placeholder="Como te chamamos" required maxlength="100" />
+
+    <label for="solicitanteWhatsapp">Seu WhatsApp (opcional)</label>
+    <input type="text" id="solicitanteWhatsapp" name="solicitanteWhatsapp" placeholder="DDI + DDD + número, ex: 5548999999999" maxlength="20" />
+    <p style="color: var(--muted); font-size: 12.5px; margin: 6px 0 0;">Se deixar, avisamos por lá quando resolvermos.</p>
+
     <label for="descricao">Detalhes</label>
     <textarea id="descricao" name="descricao" placeholder="Descreva o problema ou o pedido com o máximo de detalhe possível"></textarea>
 
@@ -637,6 +789,12 @@ const PAGINA_PAINEL = `<!DOCTYPE html>
   }
   .chamado h3 { margin: 0 0 8px; font-size: 17px; font-weight: 600; }
   .chamado p { margin: 0 0 12px; color: var(--muted); font-size: 14px; line-height: 1.5; white-space: pre-wrap; }
+  .imagens { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
+  .imagens img {
+    width: 84px; height: 84px; object-fit: cover; border-radius: 8px;
+    border: 1px solid var(--border); display: block;
+  }
+  .feedback { font-size: 13px; color: var(--green); margin-top: 10px; }
   .meta { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; align-items: center; }
   .chip {
     font-size: 11.5px;
@@ -721,6 +879,11 @@ const PAGINA_PAINEL = `<!DOCTYPE html>
       div.innerHTML = \`
         <h3>\${c.titulo}</h3>
         \${c.descricao ? \`<p>\${c.descricao}</p>\` : ""}
+        \${c.imagens && c.imagens.length ? \`<div class="imagens">\${c.imagens.map((img) =>
+          \`<a href="/api/anexo/\${c.id}/\${img.id}?senha=\${encodeURIComponent(senhaAtual)}" target="_blank" rel="noopener">
+            <img src="/api/anexo/\${c.id}/\${img.id}?senha=\${encodeURIComponent(senhaAtual)}" alt="\${img.nome || "anexo"}" />
+          </a>\`
+        ).join("")}</div>\` : ""}
         <div class="meta">
           \${c.etiquetas.map((e) => \`<span class="chip" data-cor="\${e.color}">\${e.name}</span>\`).join("")}
           \${dataFmt ? \`<span class="chip data">Precisa até \${dataFmt}</span>\` : ""}
@@ -729,20 +892,50 @@ const PAGINA_PAINEL = `<!DOCTYPE html>
           <button class="btn-resolver" data-id="\${c.id}">Marcar como resolvido</button>
           <a href="\${c.url}" target="_blank" rel="noopener">Ver no Trello →</a>
         </div>
+        <div class="feedback" style="display:none;"></div>
       \`;
+      div.dataset.titulo = c.titulo;
+      div.dataset.descricao = c.descricao || "";
       listaEl.appendChild(div);
     });
 
     document.querySelectorAll(".btn-resolver").forEach((btn) => {
       btn.addEventListener("click", async () => {
         btn.disabled = true;
-        btn.textContent = "Resolvendo...";
+        btn.textContent = "Movendo...";
+        const cardEl = btn.closest(".chamado");
         try {
-          await chamarApi(\`/api/chamados/\${btn.dataset.id}/resolver\`, { method: "POST" });
-          btn.closest(".chamado").remove();
-          if (!document.querySelectorAll(".chamado").length) {
-            document.getElementById("vazio").style.display = "block";
-          }
+          const data = await chamarApi(\`/api/chamados/\${btn.dataset.id}/resolver\`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ titulo: cardEl.dataset.titulo, descricao: cardEl.dataset.descricao }),
+          });
+          const feedback = cardEl.querySelector(".feedback");
+          feedback.style.display = "block";
+          feedback.innerHTML = \`
+            <p style="margin: 0 0 8px;">
+              Movido pra aguardando aprovação\${data.solicitante ? \` — avise <strong>\${data.solicitante}</strong>\` : ""}
+              com este link, pra confirmar que ficou certo:
+            </p>
+            <input readonly id="link-\${btn.dataset.id}" value="\${data.linkConfirmacao}"
+              style="width:100%; background:var(--panel-2); border:1px solid var(--border); border-radius:6px; padding:8px 10px; color:var(--text); font-size:12.5px; margin-bottom:8px;" />
+            <div style="display:flex; gap:8px;">
+              <button type="button" class="btn-copiar" data-link="\${data.linkConfirmacao}" style="flex:1; background:var(--panel-2); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:8px; font-size:13px; cursor:pointer;">Copiar link</button>
+              <button type="button" class="btn-concluir" style="flex:1; background:var(--accent); color:#0e1016; border:none; border-radius:6px; padding:8px; font-size:13px; font-weight:700; cursor:pointer;">Já mandei ✓</button>
+            </div>
+          \`;
+          btn.remove();
+          feedback.querySelector(".btn-copiar").addEventListener("click", (e) => {
+            navigator.clipboard.writeText(e.target.dataset.link);
+            e.target.textContent = "Copiado!";
+            setTimeout(() => (e.target.textContent = "Copiar link"), 1500);
+          });
+          feedback.querySelector(".btn-concluir").addEventListener("click", () => {
+            cardEl.remove();
+            if (!document.querySelectorAll(".chamado").length) {
+              document.getElementById("vazio").style.display = "block";
+            }
+          });
         } catch (err) {
           btn.disabled = false;
           btn.textContent = "Marcar como resolvido";
