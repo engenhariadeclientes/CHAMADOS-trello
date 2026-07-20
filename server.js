@@ -225,14 +225,14 @@ const PAGINA_HTML = `<!DOCTYPE html>
   .etiquetas { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; }
   .etiqueta {
     position: relative;
-    border-radius: 10px;
+    border-radius: 8px;
     border: 2px solid transparent;
-    padding: 14px 10px;
+    padding: 9px 8px;
     cursor: pointer;
     text-align: center;
-    font-size: 12.5px;
+    font-size: 11px;
     font-weight: 600;
-    line-height: 1.35;
+    line-height: 1.3;
     color: #14161c;
     transition: transform 0.1s, border-color 0.15s;
     user-select: none;
@@ -339,7 +339,9 @@ const PAGINA_HTML = `<!DOCTYPE html>
     .then((r) => r.json())
     .then((data) => {
       etiquetasEl.innerHTML = "";
-      (data.labels || []).forEach((label, i) => {
+      // Ignora etiquetas sem nome (cores padrão do Trello que ninguém renomeou).
+      const labelsComNome = (data.labels || []).filter((l) => l.name && l.name.trim());
+      labelsComNome.forEach((label, i) => {
         const wrapper = document.createElement("label");
         wrapper.className = "etiqueta";
         wrapper.dataset.cor = label.color || "grey";
