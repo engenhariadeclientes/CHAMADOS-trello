@@ -227,13 +227,15 @@ app.get("/api/meus-chamados", async (req, res) => {
   try {
     await garantirCache();
 
-    const telefoneBuscado = apenasDigitos(req.query.telefone);
-    if (!telefoneBuscado || telefoneBuscado.length < 8) {
-      return res.status(400).json({ error: "Digite um telefone válido." });
+    const nomeBuscado = String(req.query.nome || "").trim().toLowerCase();
+    if (!nomeBuscado) {
+      return res.status(400).json({ error: "Digite um nome." });
     }
 
+    // filter=all traz também os cancelados (arquivados), pra continuarem
+    // aparecendo na busca com o status certo em vez de sumir sem explicação.
     const cardsRes = await fetch(
-      `https://api.trello.com/1/boards/${TRELLO_BOARD_ID}/cards/open?${auth()}&fields=name,desc,idList,shortUrl,dateLastActivity`
+      `https://api.trello.com/1/boards/${TRELLO_BOARD_ID}/cards/all?${auth()}&fields=name,desc,idList,shortUrl,dateLastActivity,closed`
     );
     if (!cardsRes.ok) throw new Error(`Falha ao buscar cartões: ${cardsRes.status}`);
     const cards = await cardsRes.json();
@@ -241,12 +243,19 @@ app.get("/api/meus-chamados", async (req, res) => {
     const meus = cards
       .filter((c) => {
         const solicitante = extrairSolicitante(c.desc);
-        return solicitante && apenasDigitos(solicitante.telefone) === telefoneBuscado;
+        return solicitante && solicitante.nome.toLowerCase().includes(nomeBuscado);
       })
       .map((c) => ({
+        id: c.id,
         titulo: c.name,
-        status: cache.nomesDasListas[c.idList] || "Em andamento",
-        finalizado: c.idList === cache.idListFinalizada,
+        status: c.closed
+          ? "Cancelado"
+          : c.idList === cache.idListFinalizada
+          ? "Finalizado"
+          : cache.nomesDasListas[c.idList] || "Em andamento",
+        finalizado: !c.closed && c.idList === cache.idListFinalizada,
+        cancelado: !!c.closed,
+        aguardandoAprovacao: !c.closed && c.idList === cache.idListAprovacao,
         ultimaAtividade: c.dateLastActivity,
       }))
       .sort((a, b) => new Date(b.ultimaAtividade) - new Date(a.ultimaAtividade));
@@ -254,6 +263,69 @@ app.get("/api/meus-chamados", async (req, res) => {
     res.json({ chamados: meus });
   } catch (err) {
     console.error("Erro ao buscar chamados do solicitante:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// A partir daqui, ações que a PESSOA QUE ABRIU O CHAMADO pode fazer direto
+// pelo /meus-chamados — sem senha de admin, na mesma lógica de "achou pelo
+// nome, mexe no que é dela".
+
+app.post("/api/meus-chamados/:id/cancelar", express.json(), async (req, res) => {
+  try {
+    const moveRes = await fetch(`https://api.trello.com/1/cards/${req.params.id}?${auth()}&closed=true`, {
+      method: "PUT",
+    });
+    if (!moveRes.ok) throw new Error(`Trello recusou cancelar: ${moveRes.status}`);
+    console.log(`🚫 Chamado ${req.params.id} cancelado pelo solicitante.`);
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Erro ao cancelar chamado:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/meus-chamados/:id/decisao", express.json(), async (req, res) => {
+  try {
+    await garantirCache();
+    const { decisao } = req.body || {};
+    const listaDestino = decisao === "reabrir" ? cache.idList : cache.idListFinalizada;
+    const nomeLista = decisao === "reabrir" ? LISTA_DESTINO : LISTA_FINALIZADA;
+
+    if (!listaDestino) {
+      return res.status(500).json({ error: `Lista "${nomeLista}" não encontrada no board.` });
+    }
+
+    const moveRes = await fetch(
+      `https://api.trello.com/1/cards/${req.params.id}?${auth()}&idList=${listaDestino}`,
+      { method: "PUT" }
+    );
+    if (!moveRes.ok) throw new Error(`Trello recusou mover o cartão: ${moveRes.status}`);
+
+    console.log(`✅ Chamado ${req.params.id} — decisão do solicitante pelo HUD: ${decisao}`);
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Erro ao processar decisão:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/meus-chamados/:id/comentario", express.json(), async (req, res) => {
+  try {
+    const texto = ((req.body && req.body.texto) || "").trim();
+    if (!texto) return res.status(400).json({ error: "Escreva alguma coisa antes de enviar." });
+
+    const params = new URLSearchParams({ text: texto });
+    const comentRes = await fetch(
+      `https://api.trello.com/1/cards/${req.params.id}/actions/comments?${auth()}&${params.toString()}`,
+      { method: "POST" }
+    );
+    if (!comentRes.ok) throw new Error(`Trello recusou adicionar o comentário: ${comentRes.status}`);
+
+    console.log(`💬 Comentário adicionado ao chamado ${req.params.id} pelo solicitante.`);
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Erro ao adicionar comentário:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -636,8 +708,11 @@ const PAGINA_HTML = `<!DOCTYPE html>
 </head>
 <body>
 <main>
-  <h1>Abrir chamado</h1>
-  <p class="subtitulo">Cai direto na lista Tarefas Pendentes do board. <a href="/meus-chamados" style="color: var(--accent);">Já abriu um chamado? Confira o status aqui →</a></p>
+  <div style="display:flex; justify-content: space-between; align-items: flex-start; gap: 16px; margin-bottom: 6px;">
+    <h1>Abrir chamado</h1>
+    <a href="/meus-chamados" style="flex-shrink:0; background: var(--panel-2); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 9px 14px; font-size: 13px; font-weight: 600; text-decoration: none; white-space: nowrap;">Chamados abertos</a>
+  </div>
+  <p class="subtitulo">Cai direto na lista Tarefas Pendentes do board.</p>
 
   <form class="card" id="form-chamado">
     <label for="titulo">Título</label>
@@ -1024,57 +1099,201 @@ const PAGINA_MEUS_CHAMADOS = `<!DOCTYPE html>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
 <style>
-  :root { --bg:#12141b; --panel:#1a1d27; --panel-2:#21252f; --border:#2b2f3b; --text:#e9eaee; --muted:#8b93a7; --green:#61bd4f; --accent:#6e8fff; }
+  :root { --bg:#12141b; --panel:#1a1d27; --panel-2:#21252f; --border:#2b2f3b; --text:#e9eaee; --muted:#8b93a7; --green:#61bd4f; --red:#eb5a46; --accent:#6e8fff; }
   * { box-sizing: border-box; }
   body { margin:0; background:var(--bg); color:var(--text); font-family:'Inter',sans-serif; min-height:100vh; padding:48px 20px 80px; }
-  main { max-width:520px; margin:0 auto; }
+  main { max-width:560px; margin:0 auto; }
   h1 { font-family:'Space Grotesk',sans-serif; font-size:26px; font-weight:700; margin:0 0 6px; }
   .subtitulo { color:var(--muted); font-size:14px; margin:0 0 28px; }
+  .subtitulo a { color: var(--accent); }
   .busca { display:flex; gap:8px; margin-bottom: 28px; }
-  input {
-    flex:1; background:var(--panel-2); border:1px solid var(--border); border-radius:8px;
-    padding:11px 13px; color:var(--text); font-size:15px; outline:none;
+  input, textarea {
+    width: 100%; background:var(--panel-2); border:1px solid var(--border); border-radius:8px;
+    padding:11px 13px; color:var(--text); font-size:14.5px; outline:none; font-family:'Inter',sans-serif;
   }
-  input:focus { border-color: var(--accent); }
+  input:focus, textarea:focus { border-color: var(--accent); }
+  .busca input { flex:1; }
   button {
     background:var(--accent); color:#0e1016; border:none; border-radius:8px;
     padding:11px 18px; font-weight:700; font-size:14px; cursor:pointer; font-family:'Inter',sans-serif;
   }
   button:disabled { opacity:0.6; cursor:not-allowed; }
-  .chamado { background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:18px 20px; margin-bottom:12px; }
-  .chamado h3 { margin:0 0 8px; font-size:15.5px; font-weight:600; }
+  button.secundario { background: var(--panel-2); color: var(--text); border: 1px solid var(--border); }
+  button.perigo { background: transparent; color: var(--red); border: 1px solid var(--red); }
+  .chamado { background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:18px 20px; margin-bottom:14px; }
+  .chamado h3 { margin:0 0 10px; font-size:15.5px; font-weight:600; }
   .status {
     display:inline-block; font-size:12px; font-weight:700; padding:4px 10px; border-radius:6px;
-    background: var(--panel-2); color: var(--muted); border: 1px solid var(--border);
+    background: var(--panel-2); color: var(--muted); border: 1px solid var(--border); margin-bottom: 14px;
   }
   .status.finalizado { background: var(--green); color:#0e1016; border-color: transparent; }
+  .status.cancelado { background: var(--red); color:#fff; border-color: transparent; }
+  .acoes { display:flex; flex-wrap: wrap; gap: 8px; }
+  .acoes button { flex: 1; min-width: 130px; }
+  .caixa-comentario { display:none; margin-top: 12px; }
+  .caixa-comentario textarea { min-height: 70px; resize: vertical; margin-bottom: 8px; }
+  .aviso { font-size: 12.5px; color: var(--green); margin-top: 10px; display:none; }
   #vazio, #erro { color:var(--muted); text-align:center; padding:30px 0; display:none; font-size:14px; }
 </style>
 </head>
 <body>
 <main>
   <h1>Meus chamados</h1>
-  <p class="subtitulo">Digite o WhatsApp que você usou ao abrir o chamado.</p>
+  <p class="subtitulo">Digite o nome que você usou ao abrir o chamado. <a href="/">← Abrir um novo chamado</a></p>
 
   <div class="busca">
-    <input type="text" id="telefone" placeholder="DDI + DDD + número, ex: 5548999999999" />
+    <input type="text" id="nome" placeholder="Seu nome" />
     <button id="btn-buscar">Buscar</button>
   </div>
 
-  <div id="erro">Não achamos nenhum chamado com esse número.</div>
+  <div id="erro">Não achamos nenhum chamado com esse nome.</div>
   <div id="vazio"></div>
   <div id="lista"></div>
 </main>
 
 <script>
-  const input = document.getElementById("telefone");
+  const input = document.getElementById("nome");
   const btn = document.getElementById("btn-buscar");
   const listaEl = document.getElementById("lista");
   const erroEl = document.getElementById("erro");
 
+  async function chamarApi(path, opts = {}) {
+    const res = await fetch(path, {
+      ...opts,
+      headers: { "Content-Type": "application/json", ...(opts.headers || {}) },
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || "Erro na requisição.");
+    return data;
+  }
+
+  function renderChamado(c) {
+    const div = document.createElement("div");
+    div.className = "chamado";
+
+    let statusClasse = "";
+    if (c.finalizado) statusClasse = "finalizado";
+    if (c.cancelado) statusClasse = "cancelado";
+
+    div.innerHTML = \`
+      <h3>\${c.titulo}</h3>
+      <span class="status \${statusClasse}">\${c.status}</span>
+      <div class="acoes"></div>
+      <div class="caixa-comentario">
+        <textarea placeholder="O que você quer adicionar ou explicar melhor?"></textarea>
+        <button class="btn-enviar-comentario">Enviar</button>
+      </div>
+      <div class="aviso"></div>
+    \`;
+
+    const acoesEl = div.querySelector(".acoes");
+    const avisoEl = div.querySelector(".aviso");
+    const caixaComentario = div.querySelector(".caixa-comentario");
+
+    function mostrarAviso(texto) {
+      avisoEl.textContent = texto;
+      avisoEl.style.display = "block";
+    }
+
+    // Confirmar resolução — só faz sentido enquanto está aguardando aprovação.
+    if (c.aguardandoAprovacao) {
+      const btnSim = document.createElement("button");
+      btnSim.textContent = "Confirmar resolvido ✅";
+      btnSim.addEventListener("click", async () => {
+        btnSim.disabled = true;
+        try {
+          await chamarApi(\`/api/meus-chamados/\${c.id}/decisao\`, {
+            method: "POST",
+            body: JSON.stringify({ decisao: "confirmar" }),
+          });
+          mostrarAviso("Show, valeu! Marcado como finalizado.");
+          acoesEl.innerHTML = "";
+        } catch (err) {
+          btnSim.disabled = false;
+          alert("Erro: " + err.message);
+        }
+      });
+
+      const btnNao = document.createElement("button");
+      btnNao.className = "secundario";
+      btnNao.textContent = "Ainda não 🔁";
+      btnNao.addEventListener("click", async () => {
+        btnNao.disabled = true;
+        try {
+          await chamarApi(\`/api/meus-chamados/\${c.id}/decisao\`, {
+            method: "POST",
+            body: JSON.stringify({ decisao: "reabrir" }),
+          });
+          mostrarAviso("Combinado — voltou pra fila pra continuarmos vendo isso.");
+          acoesEl.innerHTML = "";
+        } catch (err) {
+          btnNao.disabled = false;
+          alert("Erro: " + err.message);
+        }
+      });
+
+      acoesEl.appendChild(btnSim);
+      acoesEl.appendChild(btnNao);
+    }
+
+    // Cancelar e adicionar informação — fazem sentido enquanto não estiver
+    // cancelado nem finalizado ainda.
+    if (!c.cancelado && !c.finalizado) {
+      const btnComentar = document.createElement("button");
+      btnComentar.className = "secundario";
+      btnComentar.textContent = "Adicionar informação";
+      btnComentar.addEventListener("click", () => {
+        caixaComentario.style.display = caixaComentario.style.display === "block" ? "none" : "block";
+      });
+
+      const btnCancelar = document.createElement("button");
+      btnCancelar.className = "perigo";
+      btnCancelar.textContent = "Cancelar chamado";
+      btnCancelar.addEventListener("click", async () => {
+        if (!confirm("Cancelar esse chamado? Ele sai da fila de trabalho.")) return;
+        btnCancelar.disabled = true;
+        try {
+          await chamarApi(\`/api/meus-chamados/\${c.id}/cancelar\`, { method: "POST" });
+          mostrarAviso("Chamado cancelado.");
+          acoesEl.innerHTML = "";
+          div.querySelector(".status").textContent = "Cancelado";
+          div.querySelector(".status").className = "status cancelado";
+        } catch (err) {
+          btnCancelar.disabled = false;
+          alert("Erro: " + err.message);
+        }
+      });
+
+      acoesEl.appendChild(btnComentar);
+      acoesEl.appendChild(btnCancelar);
+    }
+
+    caixaComentario.querySelector(".btn-enviar-comentario").addEventListener("click", async (e) => {
+      const textarea = caixaComentario.querySelector("textarea");
+      const texto = textarea.value.trim();
+      if (!texto) return;
+      e.target.disabled = true;
+      try {
+        await chamarApi(\`/api/meus-chamados/\${c.id}/comentario\`, {
+          method: "POST",
+          body: JSON.stringify({ texto }),
+        });
+        textarea.value = "";
+        caixaComentario.style.display = "none";
+        mostrarAviso("Adicionado! Quem está cuidando do chamado vai ver.");
+      } catch (err) {
+        alert("Erro: " + err.message);
+      } finally {
+        e.target.disabled = false;
+      }
+    });
+
+    return div;
+  }
+
   async function buscar() {
-    const telefone = input.value.trim();
-    if (!telefone) return;
+    const nome = input.value.trim();
+    if (!nome) return;
 
     btn.disabled = true;
     btn.textContent = "Buscando...";
@@ -1082,24 +1301,12 @@ const PAGINA_MEUS_CHAMADOS = `<!DOCTYPE html>
     listaEl.innerHTML = "";
 
     try {
-      const res = await fetch(\`/api/meus-chamados?telefone=\${encodeURIComponent(telefone)}\`);
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "Erro ao buscar.");
-
+      const data = await chamarApi(\`/api/meus-chamados?nome=\${encodeURIComponent(nome)}\`);
       if (!data.chamados.length) {
         erroEl.style.display = "block";
         return;
       }
-
-      data.chamados.forEach((c) => {
-        const div = document.createElement("div");
-        div.className = "chamado";
-        div.innerHTML = \`
-          <h3>\${c.titulo}</h3>
-          <span class="status \${c.finalizado ? "finalizado" : ""}">\${c.status}</span>
-        \`;
-        listaEl.appendChild(div);
-      });
+      data.chamados.forEach((c) => listaEl.appendChild(renderChamado(c)));
     } catch (err) {
       erroEl.textContent = err.message;
       erroEl.style.display = "block";
